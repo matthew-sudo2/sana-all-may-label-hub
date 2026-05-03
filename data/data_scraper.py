@@ -42,12 +42,6 @@ DOMAINS SEARCHED (configurable)
   financial, healthcare, government, ecommerce, scientific,
   social, geospatial, sensor, sports, climate, education, transport
 
-DEPENDENCIES
-------------
-  Required : httpx, beautifulsoup4, pandas, tenacity, aiofiles, kaggle
-  Optional : playwright  (JS-rendered pages)  pip install playwright && playwright install chromium
-             duckduckgo-search                pip install duckduckgo-search
-
 USAGE
 -----
   python scraper.py                            # discover + download all domains
@@ -68,14 +62,17 @@ import json
 import logging
 import os
 import re
+import random
 import time
 import zipfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, urlencode, quote_plus
+from urllib.parse import urlparse, urlencode, quote_plus, unquote, parse_qs
 from urllib.robotparser import RobotFileParser
+
+from dotenv import load_dotenv
 
 import aiofiles
 import httpx
@@ -85,6 +82,10 @@ from tenacity import (
     retry, stop_after_attempt, wait_exponential,
     retry_if_exception_type, before_sleep_log,
 )
+
+# Load environment variables from .env file (for Kaggle API, etc.)
+load_dotenv()
+load_dotenv("backend/.env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,7 +104,7 @@ class ScraperConfig:
     max_concurrency: int    = 8
     request_timeout: float  = 30.0
     min_rows: int           = 50
-    max_file_mb: float      = 150.0
+    max_file_mb: float      = 50000.0    # Allow very large datasets
     per_domain: int         = 5          # target datasets per domain per adapter
     user_agent: str         = (
         "Mozilla/5.0 (compatible; DataQualityResearchBot/2.0; "
@@ -112,6 +113,7 @@ class ScraperConfig:
     respect_robots: bool    = True
     rate_limit_delay: float = 1.5        # seconds between requests to same domain
     dry_run: bool           = False      # discover only, skip downloads
+    max_total_datasets: int = 300        # Stop after downloading this many datasets
 
 
 CFG = ScraperConfig()
@@ -163,10 +165,13 @@ class DatasetCandidate:
 
     @property
     def slug(self) -> str:
-        """Stable slug derived from URL hash + sanitised title."""
-        h     = hashlib.md5(self.url.encode()).hexdigest()[:6]
+        """Stable slug derived from normalized URL hash + sanitised title."""
+        # Normalize URL: strip trailing slash, lower case, remove fragments
+        parsed = urlparse(self.url.lower().rstrip("/"))
+        norm_url = f"{parsed.netloc}{parsed.path}"
+        h     = hashlib.md5(norm_url.encode()).hexdigest()[:8]
         title = re.sub(r"[^\w]", "_", self.title.lower())[:40].strip("_")
-        return f"{self.source_adapter}_{title}_{h}"
+        return f"{title}_{h}"
 
 
 @dataclass
@@ -314,14 +319,17 @@ class KaggleSearchAdapter(BaseAdapter):
 
     def _search_sync(self, query: str, domain: str, limit: int) -> list[DatasetCandidate]:
         try:
-            from kaggle.api.kaggle_api_extended import KaggleApiExtended
+            # Modern kaggle package uses KaggleApi
+            from kaggle.api.kaggle_api_extended import KaggleApi as KaggleApiExtended
         except ImportError:
             log.warning("kaggle package not installed. Skipping Kaggle adapter.")
             return []
         try:
             api = KaggleApiExtended()
             api.authenticate()
-            results = api.dataset_list(search=query, sort_by="votes", page=1)
+            # RANDOMIZATION: Use a random page to discover new datasets
+            page = random.randint(1, 5)
+            results = api.dataset_list(search=query, sort_by="votes", page=page)
         except Exception as exc:
             log.warning("[kaggle] Search failed for '%s': %s", query, exc)
             return []
@@ -354,7 +362,7 @@ class KaggleSearchAdapter(BaseAdapter):
 
     def download_sync(self, candidate: DatasetCandidate) -> Optional[list[pd.DataFrame]]:
         try:
-            from kaggle.api.kaggle_api_extended import KaggleApiExtended
+            from kaggle.api.kaggle_api_extended import KaggleApi as KaggleApiExtended
         except ImportError:
             return None
         api = KaggleApiExtended()
@@ -367,9 +375,14 @@ class KaggleSearchAdapter(BaseAdapter):
             log.error("[kaggle] Download failed for %s: %s", candidate.slug, exc)
             return None
         dfs = []
-        for csv_path in list(tmp.rglob("*.csv"))[:5]:
+        # STRICT FIX: Only load .csv files; ABSOLUTELY EXCLUDE .txt or .zip extensions
+        for csv_path in list(tmp.rglob("*")):
+            if csv_path.suffix.lower() != ".csv":
+                continue
             try:
                 dfs.append(pd.read_csv(csv_path, low_memory=False))
+                if len(dfs) >= 10: 
+                    break
             except Exception:
                 pass
         return dfs or None
@@ -491,6 +504,7 @@ class DataGovAdapter(BaseAdapter):
             "rows":         limit * 2,   # overfetch, filter to CSV below
             "fq":           'res_format:"CSV"',
             "sort":         "score desc",
+            "start":        random.randint(0, 50), # RANDOMIZATION: Random offset
         }
         try:
             resp = await robust_get(client, self.BASE_URL, params=params)
@@ -585,9 +599,10 @@ class OpenDataSoftAdapter(BaseAdapter):
 
     async def search(self, query, domain, client, limit=10):
         params = {
-            "where":   query,
+            "q":       query,
             "limit":   limit,
             "order_by": "explore_count desc",
+            "offset":  random.randint(0, 20), # RANDOMIZATION: Random offset
         }
         try:
             resp = await robust_get(client, self.BASE_URL, params=params)
@@ -751,7 +766,6 @@ class DDGSearchAdapter(BaseAdapter):
             href = link_el.get("href", link_el.get_text(strip=True))
             # DuckDuckGo wraps links — extract real URL
             if "uddg=" in href:
-                from urllib.parse import unquote, parse_qs
                 qs   = parse_qs(urlparse(href).query)
                 href = unquote(qs.get("uddg", [href])[0])
             if not href.startswith("http"):
@@ -799,10 +813,13 @@ class GoogleDatasetAdapter(BaseAdapter):
                 title = data.get("name", "")
                 desc  = data.get("description", "")[:300]
                 # Look for CSV distribution
-                for dist in data.get("distribution", []):
-                    enc_fmt = dist.get("encodingFormat", "").lower()
+                distributions = data.get("distribution", [])
+                if isinstance(distributions, dict):
+                    distributions = [distributions]
+                for dist in distributions:
+                    enc_fmt = str(dist.get("encodingFormat", "")).lower()
                     url     = dist.get("contentUrl") or dist.get("url", "")
-                    if "csv" in enc_fmt or url.endswith(".csv"):
+                    if "csv" in enc_fmt or str(url).endswith(".csv"):
                         candidates.append(DatasetCandidate(
                             title=title, url=url, domain=domain,
                             source_adapter=self.name, description=desc,
@@ -851,7 +868,10 @@ async def download_candidate(
     fmt   = candidate.file_format
     path  = output_path(candidate.domain, candidate.slug)
 
-    # ── Kaggle ref ────────────────────────────────────────────────────────────
+    # STRICT FIX: Reject .txt files immediately
+    if candidate.url.lower().endswith(".txt") or ".txt" in candidate.url.lower().split("?")[0]:
+        log.warning("[%s] Skipping forbidden .txt file: %s", candidate.slug, candidate.url)
+        return None
     if fmt == "kaggle_ref" and kaggle_adapter:
         loop = asyncio.get_event_loop()
         dfs  = await loop.run_in_executor(None, kaggle_adapter.download_sync, candidate)
@@ -886,15 +906,17 @@ async def download_candidate(
     raw          = resp.content
 
     # ── ZIP archive ───────────────────────────────────────────────────────────
-    if "zip" in content_type or candidate.url.lower().endswith(".zip"):
+    if "application/zip" in content_type or candidate.url.lower().endswith(".zip"):
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                csv_name = next(
-                    (n for n in zf.namelist() if n.endswith(".csv")), None
-                )
-                if not csv_name:
-                    log.warning("[%s] No CSV inside ZIP.", candidate.slug)
+                # STRICT FIX: ONLY look for .csv files; ignore .txt, .json, etc.
+                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csv_names:
+                    log.warning("[%s] No CSV found in ZIP. Skipping archive.", candidate.slug)
                     return None
+                
+                # Pick the largest CSV file in the zip
+                csv_name = max(csv_names, key=lambda n: zf.getinfo(n).file_size)
                 raw = zf.read(csv_name)
         except Exception as exc:
             log.error("[%s] ZIP extraction failed: %s", candidate.slug, exc)
@@ -927,7 +949,7 @@ async def download_candidate(
         if html.count("<table") == 0:
             html = await _playwright_fetch(candidate.url) or html
         try:
-            tables = pd.read_html(html)
+            tables = pd.read_html(io.StringIO(html))
             if not tables:
                 return None
             df = tables[0]
@@ -1100,53 +1122,87 @@ async def run_pipeline(
         "Accept":          "text/html,application/xhtml+xml,application/json,text/csv,*/*",
     }
 
-    async with httpx.AsyncClient(
-        timeout  = CFG.request_timeout,
-        headers  = headers,
-        follow_redirects = True,
-    ) as client:
+    try:
 
-        for domain in domains:
-            queries    = DOMAIN_QUERIES.get(domain, [domain])
-            candidates = await discover_domain(
-                domain, queries, adapters, client, semaphore, per_domain
-            )
+        async with httpx.AsyncClient(
+            timeout=CFG.request_timeout,
+            headers=headers,
+            follow_redirects=True,
+        ) as client:
+            # RANDOMIZATION: Shuffle domains and queries to get unique results each run
+            shuffled_domains = list(domains)
+            random.shuffle(shuffled_domains)
 
-            if CFG.dry_run:
-                log.info("[dry-run] %s: %d candidates discovered (no downloads)", domain, len(candidates))
+            for domain in shuffled_domains:
+                queries = DOMAIN_QUERIES.get(domain, [domain])
+                random.shuffle(queries)
+                
+                # Use a different subset of queries or add a random noise word occasionally
+                # to get different search results from engines like DDG
+                candidates = await discover_domain(
+                    domain, queries, adapters, client, semaphore, per_domain
+                )
+
+                # DEDUPLICATION: Only download what we don't have
+                # 1. Check if slug in manifest
+                # 2. Check if the output file already exists on disk
+                new_candidates = []
                 for c in candidates:
-                    log.info("  [%s] %.0f pts  %s  %s", c.source_adapter, c.score, c.file_format, c.title[:70])
-                continue
+                    if c.slug in manifest:
+                        continue
+                    if output_path(c.domain, c.slug).exists():
+                        log.debug("[%s] File exists on disk. Skipping.", c.slug)
+                        continue
+                    new_candidates.append(c)
 
-            # Download candidates for this domain concurrently
-            async def _download(c: DatasetCandidate):
-                async with semaphore:
-                    return await download_candidate(c, client, kaggle_adp)
-
-            acquired = await asyncio.gather(*[_download(c) for c in candidates])
-
-            for result in acquired:
-                if result is None:
-                    errors += 1
+                if not new_candidates and candidates:
+                    log.info("[%s] No new datasets found in this batch.", domain)
                     continue
-                total_rows  += result.rows
-                total_saved += 1
-                entry = {
-                    **asdict(result.candidate),
-                    "path":      str(result.path),
-                    "rows":      result.rows,
-                    "columns":   result.columns,
-                    "elapsed_s": result.elapsed_s,
-                    "status":    result.status,
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                }
-                manifest[result.candidate.slug] = entry
 
-    save_manifest(manifest)
-    log.info("═" * 60)
-    log.info("Complete. %d files saved | %d total rows | %d skipped/failed",
-             total_saved, total_rows, errors)
-    log.info("Manifest → %s", CFG.manifest_file)
+                if not new_candidates:
+                    continue
+
+                if CFG.dry_run:
+                    log.info("[dry-run] %s: %d new candidates discovered", domain, len(new_candidates))
+                    continue
+
+                # Download candidates for this domain concurrently
+                async def _download(c: DatasetCandidate):
+                    async with semaphore:
+                        return await download_candidate(c, client, kaggle_adp)
+
+                acquired = await asyncio.gather(*[_download(c) for c in new_candidates])
+
+                for result in acquired:
+                    if result is None:
+                        errors += 1
+                        continue
+                    
+                    total_rows  += result.rows
+                    total_saved += 1
+                    entry = {
+                        **asdict(result.candidate),
+                        "path":      str(result.path),
+                        "rows":      result.rows,
+                        "columns":   result.columns,
+                        "elapsed_s": result.elapsed_s,
+                        "status":    result.status,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    manifest[result.candidate.slug] = entry
+
+                    if len(manifest) >= CFG.max_total_datasets:
+                        log.info("Reached target limit of %d datasets.", CFG.max_total_datasets)
+                        return
+
+
+    finally:
+        save_manifest(manifest)
+        log.info("═" * 60)
+        log.info("Session Summary: %d new files saved | %d total rows | %d errors",
+                 total_saved, total_rows, errors)
+        log.info("Total manifest entries: %d", len(manifest))
+        log.info("Manifest → %s", CFG.manifest_file)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1186,6 +1242,10 @@ def main() -> None:
         "--list-domains", action="store_true",
         help="Print available domains and exit",
     )
+    parser.add_argument(
+        "--limit", type=int, default=CFG.max_total_datasets,
+        help=f"Stop after this many datasets (default: {CFG.max_total_datasets})",
+    )
 
     args = parser.parse_args()
 
@@ -1199,6 +1259,7 @@ def main() -> None:
     CFG.dry_run         = args.dry_run
     CFG.output_dir      = args.output_dir
     CFG.per_domain      = args.per_domain
+    CFG.max_total_datasets = args.limit
 
     adapters = ALL_ADAPTERS
     if args.adapters:
@@ -1209,7 +1270,12 @@ def main() -> None:
     log.info("Per domain: %d  |  Workers: %d  |  Dry-run: %s",
              CFG.per_domain, CFG.max_concurrency, CFG.dry_run)
 
-    asyncio.run(run_pipeline(args.domains, adapters, CFG.per_domain))
+    try:
+        asyncio.run(run_pipeline(args.domains, adapters, CFG.per_domain))
+    except KeyboardInterrupt:
+        log.info("\n[!] Shutdown signal received (Ctrl+C). Saving progress and exiting...")
+    except Exception as exc:
+        log.error("Pipeline crashed: %s", exc)
 
 
 if __name__ == "__main__":
