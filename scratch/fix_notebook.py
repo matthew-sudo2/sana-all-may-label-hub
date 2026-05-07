@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-notebook_path = Path(r"c:\Users\User\Documents\GitHub\Information-Management-Finals-E-Commerce-Dashboard\MarketMate\sana-ai-hub\notebook\rf_vs_xgboost_comparison.ipynb")
+notebook_path = Path(r"c:\Users\User\Documents\GitHub\Information-Management-Finals-E-Commerce-Dashboard\MarketMate\sana-ai-hub\notebook\rf_vs_xgboost_comparison_3.ipynb")
 
 if not notebook_path.exists():
     print(f"Error: {notebook_path} not found")
@@ -42,9 +42,39 @@ for cell in nb['cells']:
             found_xgb = True
         break
 
-if found_leakage or found_xgb:
+# Add New Cell: Save Models
+save_models_code = [
+    "import joblib\n",
+    "import os\n",
+    "\n",
+    "# Create models directory if it doesn't exist\n",
+    "os.makedirs('../models', exist_ok=True)\n",
+    "\n",
+    "# Save Random Forest Pipeline (includes Scaler + Model)\n",
+    "joblib.dump(rf_pipeline, '../models/random_forest_model.joblib')\n",
+    "\n",
+    "# Save XGBoost Pipeline (includes Scaler + Model)\n",
+    "joblib.dump(xgb_pipeline, '../models/xgboost_model.joblib')\n",
+    "\n",
+    "print(\"Models saved successfully in the 'models/' directory! ✅\")"
+]
+
+# Check if save cell already exists to avoid duplication
+if not any('joblib.dump' in "".join(c['source']) for c in nb['cells']):
+    nb['cells'].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": save_models_code
+    })
+    found_save = True
+else:
+    found_save = False
+
+if found_leakage or found_xgb or found_save:
     with open(notebook_path, 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
-    print(f"Successfully updated notebook: leakage={found_leakage}, xgb={found_xgb}")
+    print(f"Successfully updated notebook: leakage={found_leakage}, xgb={found_xgb}, save={found_save}")
 else:
-    print("Could not find cells to update.")
+    print("No changes needed.")

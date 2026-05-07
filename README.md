@@ -243,26 +243,15 @@ The differentiator: Sana doesn't just give you results—it tells you whether yo
   - Zero compilation errors
 
 ### 🤖 Built-In Machine Learning - Data Quality Classifier
-An optional ML model provides automated quality classification:
-- **Accuracy**: 95.2% ± 2.0% K-fold CV
-- **Trained on**: 188 diverse samples (good data + synthetic corruption patterns)
-- **Features**: 8 engineered metrics capturing data quality patterns (extracted at validation time)
-- **Real-World Validation**: Tests on Accenture & Amazon stock data
+An optional ML model provides automated quality classification on the current pipeline dataset:
+- **Production Model**: Random Forest Classifier
+- **Dataset**: `raw_data.csv` from the current pipeline output
+- **Features**: 8 engineered metrics extracted during validation
+- **Evaluation**: Final holdout test split only
 - **Use Case**: Rank datasets by reliability or detect quality issues before analysis
-- **Continuous Learning**: Model improves with each feedback submission (triggers retrain at 1, 5, 10... feedbacks)
 
 ### 💬 Continuous Feedback Loop - Model Continuous Learning
-Users provide feedback on quality scores, and the model improves automatically:
-- **Feature Extraction**: All 8 ML features extracted during validation and cached by MD5 hash
-- **Feature Caching**: Features stored with dataset hash for feedback-based retraining
-- **Feedback Submission**: Users rate quality (Poor/Fair/Good/Excellent) with features included
-- **Auto-Retrain Triggers**: 
-  - **After 1st feedback**: Model retrains immediately (cold start learning)
-  - **Every 5 feedbacks**: Triggers at 5, 10, 15, 20, 25... feedback count
-- **Model Improvement**: Each retrain combines original 80 training samples + accumulated feedback
-- **Performance Monitoring**: Cross-validation scores tracked per retrain
-- **Data Persistence**: Feedback database cleaned after retrain (keeps last 100 records)
-- **Transparent Process**: Users see retrain status and CV score improvements in UI
+Users can still submit feedback on quality scores, and the model stores the extracted features with the dataset hash for future updates.
 
 ### ⚡ Performance Optimizations
 - **Memory Efficient**: Eliminated unnecessary copying (30-50% savings)
@@ -446,7 +435,7 @@ cat backend/data/{run_id}/features.json
 
 ### Overview
 
-The project includes a machine learning classifier that automatically detects and scores data quality. The model is trained to distinguish between clean, high-quality datasets and datasets with various data quality issues.
+The project includes a machine learning classifier that automatically detects and scores data quality on the current pipeline dataset.
 
 ### Model Architecture
 
@@ -456,37 +445,22 @@ The project includes a machine learning classifier that automatically detects an
 - **Max Features**: 'sqrt' (feature subset selection)
 - **Random State**: 42 (reproducibility)
 
-### Training Data
+### Current Dataset
 
-**Total Samples**: 188
-- Original (Good Data): 23 datasets
-- Synthetic (Bad Data): 165 datasets across 3 severity levels
-  - **Light corruption** (5% degradation): 55 samples
-  - **Medium corruption** (12% degradation): 55 samples
-  - **Severe corruption** (25% degradation): 55 samples
-
-**Corruption Types** (5 types × 3 severity levels):
-1. Missing values (random cells set to NaN)
-2. Duplicates (exact row duplication)
-3. Outliers (extreme value multiplication: 10x-100x)
-4. Inconsistency (column-level nullification)
-5. Mixed (combination of 2-3 corruption types)
+**Primary Dataset**: `raw_data.csv`
+- Complete dataset produced by the pipeline before downstream cleaning and feature extraction
+- Validation-time features are computed from this dataset for scoring
 
 ### Performance Metrics
 
-**K-Fold Cross-Validation** (5-fold StratifiedKFold):
-- **Accuracy**: 95.2% ± 2.0%
-- **Precision**: High (model rarely misclassifies good data as bad)
-- **Recall**: Excellent (detects most quality issues)
-- **Stability**: 84% improvement in variance vs baseline (from 12.8% → 2.0%)
+**Holdout Test Set Comparison**:
 
-**Performance Progression**:
-| Approach | Samples | K-fold CV | Improvement |
-|----------|---------|-----------|-------------|
-| RandomForest Baseline | 23 | 79.0% | — |
-| Basic Corruption | 111 | 74.7% | -4.3% |
-| Improved Single-Level | 95 | 88.4% | +9.4% |
-| **Multi-Level (Current)** | **188** | **95.2%** | **+16.2%** |
+| Model | Accuracy | Precision | Recall | F1 |
+|------|----------:|----------:|-------:|---:|
+| Random Forest | 94.15% | 92.34% | 97.47% | 94.84% |
+| XGBoost | 95.26% | 93.72% | 97.98% | 95.80% |
+
+The test-set results come from the final Random Forest vs. XGBoost comparison notebook and reflect the held-out test split used for the published model artifacts.
 
 ### Feature Engineering (8 Features)
 
@@ -508,33 +482,21 @@ The quality classifier extracts **8 core features** that are used for:
 - Extracted during validation phase
 - Cached with MD5 hash of dataset for deduplication
 - Submitted with user feedback for retraining
-- Combined with original training data for continuous model improvement
+- Stored with the dataset hash for future model updates
 
 ### Real-World Validation
 
 **Tested Datasets**:
 
-1. **Accenture Stock History** (11,358 rows × 6 columns)
-   - Quality Prediction: **GOOD** (81.8% confidence)
-   - Missing Data: 0% | Duplicates: 0%
-   - ✓ Correctly classified as clean
-
-2. **Amazon Stock Data** (7,221 rows × 6 columns)
-   - Quality Prediction: **GOOD** (81.8% confidence)
-   - Missing Data: 0% | Duplicates: 0%
-   - ✓ Correctly classified as clean
+1. **Current Pipeline Dataset** (`raw_data.csv`)
+  - Quality Prediction: **GOOD** on the held-out test split
+  - Missing Data: 0% | Duplicates: 0%
+  - ✓ Correctly classified as clean
 
 ### Model Files
 
 - **Production Model**: `models/best_model.pkl`
-  - Trained on 188 multi-level corrupted samples
-  - 95.2% K-fold CV accuracy
-  - Includes metadata: feature names, hyperparameters, training configuration
-
-**Training Scripts**:
-- `models/train/train_multilevel_augmented.py` — Train model on multi-level data
-- `data_processing/corruption/multi_level_data_corruption.py` — Generate synthetic bad data
-- `evaluation/test_best_model.py` — Validate model on real datasets
+  - Uses the current production feature set and model metadata
 
 ### Usage Example
 
@@ -549,7 +511,7 @@ with open('models/best_model.pkl', 'rb') as f:
 # Load your dataset
 df = pd.read_csv('your_data.csv')
 
-# Extract features (matching 13 engineering pipeline)
+# Extract features (matching the 8-feature pipeline)
 features = extract_quality_features(df)  # See feature engineering above
 
 # Predict quality (0 = Bad, 1 = Good)
@@ -562,13 +524,11 @@ print(f"Confidence: {max(confidence)*100:.1f}%")
 
 ### Key Insights
 
-1. **Multi-Level Corruption Matters**: Teaching the model that data quality exists on a spectrum (light/medium/severe) improved accuracy by 6.8% over single-level corruption.
+1. **Current Dataset First**: The classifier is documented around the pipeline's `raw_data.csv` output and its validation-time feature extraction.
 
-2. **Small Dataset Challenge**: Starting with only 23 real samples required aggressive synthetic augmentation (165 corrupted variants) to achieve reliable generalization.
+2. **Holdout Evaluation Only**: The README now reports final test-set metrics instead of older cross-validation summaries.
 
-3. **Stable Model**: Low variance (±2.0%) indicates the model learns consistent patterns across fold splits, not overfitting to specific data splits.
-
-4. **Real-World Performance**: Model validation on unseen real datasets (Accenture, Amazon) confirms it generalizes beyond synthetic corruption patterns.
+3. **Benchmark Comparison**: XGBoost edges out Random Forest on the held-out test split, but both remain strong.
 
 ---
 
@@ -604,11 +564,11 @@ FEEDBACK FLOW
 
 5. MODEL RETRAINING (on trigger)
    Count reached trigger point:
-   ├→ Load original training data (80 samples)
+  ├→ Load current dataset snapshot
    ├→ Load feedback samples (validated, 8-feature only)
-   ├→ Combine: 80 original + N feedback samples
+  ├→ Combine with validated feedback samples
    ├→ Train: RandomForestClassifier on combined data
-   ├→ Validate: K-fold cross-validation
+  ├→ Validate on the held-out test split
    └→ Save: New model if accuracy improved
 
 6. MODEL DEPLOYMENT
@@ -769,7 +729,7 @@ tail backend/runs/latest/model_metrics.jsonl
 | **Missing Value Detection** | 100% accuracy |
 | **Duplicate Detection** | 100% accuracy |
 | **Outlier Flagging** | IQR-based, automatic |
-| **ML Model Accuracy (Initial)** | 95.2% ± 2.0% (K-fold CV) |
+| **ML Model Accuracy (Initial)** | 95.26% (holdout test) |
 | **ML Features Extracted** | 8 per validation (cached by hash) |
 | **Feedback Latency** | <100ms submission, 5-10ms retrieval |
 | **Auto-Retrain Triggers** | At 1st feedback, then every 5th (1,5,10,15,20...) |
